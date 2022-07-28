@@ -1,0 +1,390 @@
+#!/usr/bin/env python
+from __future__ import division, print_function
+from casacore.tables import table, makecoldesc, maketabdesc
+from datetime import datetime, timedelta
+from argparse import ArgumentParser
+from astropy.coordinates import EarthLocation, AltAz, SkyCoord
+from tqdm import tqdm
+from astropy.time import Time
+import numpy as np
+import astropy.units as unit
+from astropy.io import fits
+import time as tm
+import sys
+
+def msTime2UTC(time):
+    """
+    converts from the wierd ms time format to usable time
+
+    Parameters
+    ----------
+    time    : the wierd ms time
+
+    Returs
+    ------
+    time    : useful time
+    """
+
+    time_local = time/(24*3600)
+    tmp = Time(time_local, format='mjd')
+
+    return tmp.datetime
+
+def loadMS(args):
+    """
+    loads the required data from measurement set
+
+    Parameters
+    ----------
+    msName      : the name of the measurement set
+
+    Returns
+    -------
+    msdata      : the CORRECTED DATA column
+    msuvw       : the uvw column
+    mstime      : the time column (super weird MJD format)
+    msant1      : the antenna1 column
+    msant2      : the antenna2 column
+    mswavelength: the wavelengths 
+    antloc      : antenna locations
+    pc_ra       : the ra phase centre of the obs (deg)
+    pc_dec      : the dec phase centre of the obs (deg)
+    """
+
+    start = tm.time()
+
+    ms = table(args.ms, readonly=True, ack=False)
+    msdata = ms.getcol("CORRECTED_DATA")
+
+    try:
+        """
+        note ms column ORG_UVW is my own data column 
+        in ms where I store the farfield delays that 
+        was calculated by chgcentre (Andre's tool)
+        """
+        msuvw = ms.getcol("ORG_UVW")
+        if verbose:
+            print("ms column ORG_UVW exists")
+    except:
+        msuvw = ms.getcol("UVW")
+        if verbose:
+            print("ms column ORG_UVW does not exist. Using UVW instead.")
+
+    mstime = ms.getcol("TIME")
+    msant1 = ms.getcol("ANTENNA1")
+    msant2 = ms.getcol("ANTENNA2")
+    msfreq = ms.SPECTRAL_WINDOW.getcell("CHAN_FREQ", 0)
+    antloc = ms.ANTENNA.getcol("POSITION")
+    antname = ms.ANTENNA.getcol('NAME')
+
+    ## get the phase centre of the observation
+    pc_ra_rad , pc_dec_rad = ms.FIELD.getcol('PHASE_DIR')[0,0]
+    pc_ra , pc_dec = np.degrees(pc_ra_rad), np.degrees(pc_dec_rad)
+
+    ms.close()
+
+    # calculate wavelength
+    mswavelength = 299792458/msfreq
+
+    elapsed = tm.time() - start
+
+    if verbose:
+        print("data loaded from ms. time elapsed {}s".format(elapsed))    
+
+    return msdata, msuvw, mstime, msant1, msant2, mswavelength, antloc, antname, pc_ra, pc_dec
+
+def getLatLonAlt(x, y, z):
+    """
+    convert geocentric cartesian coordinates to lat lon and alt
+
+    Parameters
+    ----------
+    x   : x coordinate
+    y   : y coordinate
+    z   : z coordinate
+
+    Returns
+    -------
+    lat : latitude
+    lon : longitude
+    alt : altitude
+    """
+
+    pos = EarthLocation.from_geocentric(x,y,z, unit="m").to_geodetic()
+
+    return pos.lat.degree, pos.lon.degree, pos.height
+
+def getAltAz(x, y, z):
+    """
+    computes the alt-az of phase centre from geometrical centre of array
+
+    Parameters
+    ----------
+    x       : geocetric mean x position of the array
+    y       : geocetric mean y position of the array
+    z       : geocetric mean z position of the array
+
+    Returns
+    -------
+    alt     : the alt (deg) of phase centre
+    az      : the az (deg) of phase centre
+    """
+
+    lat, lon, height = getLatLonAlt(x, y, z)
+    pos = EarthLocation(lon=lon*unit.deg, lat=lat*unit.deg, height=float(str(height)[:-1])*unit.m)
+    coord = SkyCoord(pc_ra, pc_dec,unit=(unit.deg,unit.deg))
+    coord.time = timestep + timedelta(hours=pos.lon.hourangle)
+    coord = coord.transform_to(AltAz(obstime=timestep, location=pos))
+
+    return np.degrees(coord.alt.rad), np.degrees(coord.az.rad)
+
+
+def getAntXYZ(hdu, antName):
+    """
+    gets antenna's x,y,z coordinates in local reference frame.
+    
+    Note that the mean North, South, and Height values from 
+    metafits does not coincide with (0,0,0). Hence, the returned
+    positions are explicitely offseted by the mean value to force
+    the centre of the array to be at (0,0,0). This does NOT change
+    the calculated delay as it is a linear offset in the arbirarily 
+    defined cartesian reference frame and the coordinates of the focal
+    point also assumses (0,0,0) to the centre of the array
+
+
+    Parameters
+    ----------
+    hdu     : metafits file
+    antName : the name of the antenna
+
+    Returns
+    -------
+    tile_x  : x coordinate of the tile in local ref frame
+    tile_y  : y coordinate of the tile in local ref frame
+    tile_z  : z coordinate of the tile in local ref frame
+    """
+    
+    ## mean offset to apply
+    z_offset = np.mean(hdu[1].data['North'])
+    y_offset = np.mean(hdu[1].data['Height'])
+    x_offset = -np.mean(hdu[1].data['East'])
+    
+    # index of tile in metafits file
+    index = np.where(hdu[1].data['TileName'] == antName)[0][0]
+    
+    ## updated x,y,z coordinates of the tile
+    tile_z = hdu[1].data['North'][index] - z_offset
+    tile_y = hdu[1].data['Height'][index] - y_offset
+    tile_x = -hdu[1].data['East'][index] - x_offset
+    
+    return tile_x, tile_y, tile_z
+
+
+def getPhase(ant1, ant2, uvw, hdu):
+    """
+    calculates near-field phase/delay for a baseline
+
+    Parameters
+    ----------
+    ant1    : antenna 1 of the baseline being considered
+    ant2    : antenna 2 of the baseline being considered
+    uvw     : far field uvw coordinates of the baseline
+    hdu     : the metafits file for the observation
+
+    Returns
+    -------
+    phi     : the phase correction to apply to vis
+    new_w   : the calculated near-field delay (or w-term)
+
+    """
+
+    antName1 = msantname[ant1]
+    antName2 = msantname[ant2]
+    u, v, w = uvw
+
+    ## antenna positions in local cartesian reference frame
+    tile1_x, tile1_y, tile1_z = getAntXYZ(hdu, antName1)
+    tile2_x, tile2_y, tile2_z = getAntXYZ(hdu, antName2)
+
+    ## calculate distance from antennas to focal point
+    r1 = np.sqrt((tile1_x + focus_x)**2 + (tile1_y - focus_y)**2\
+              + (tile1_z - focus_z)**2)
+    r2 = np.sqrt((tile2_x + focus_x)**2 + (tile2_y - focus_y)**2\
+              + (tile2_z - focus_z)**2)
+
+    ## calculate near-field delay
+    new_w = r2 - r1
+    phi = new_w - w
+
+    return phi, new_w
+
+
+
+def worker(i, hdu):
+    """
+    worker func for a single thread
+    """
+
+    ant1 = msant1[i]
+    ant2 = msant2[i]
+
+    ## filter out auto corr.
+    if ant1 != ant2:
+        uvw = msuvw[i]
+
+        phi, w_new = getPhase(ant1, ant2, uvw, hdu)
+
+        ## update old w with new w
+        msuvw[i][2] = w_new
+
+        ## phase rotate the visibilities
+        phase = -2j*np.pi*phi/mswavelength
+        for pol in range(4):
+            tmp = np.copy(msdata[i,:,pol])
+            msdata[i,:,pol] = tmp*np.exp(phase)
+
+    return
+
+
+
+
+def main(args):
+
+    global_start = tm.time()
+
+    ## define global variables for storing ms values. Using global variables
+    ## helps a lot with memory when running in parallel (MPI not yet implimented)
+
+    global msdata, msuvw, msant1, msant2, mswavelength, antloc, \
+        noChannels, msantname, pc_ra, pc_dec
+
+    ## load ms and metafits
+    msdata, msuvw, mstime, msant1, msant2, mswavelength, antloc,\
+     msantname, pc_ra, pc_dec = loadMS(args)
+    hdu = fits.open(args.metafits)
+
+    msuvw_org = np.copy(msuvw)
+    entries = len(msant1) ## no. of entries in the measurement set timeStep x [no.baselines + auto corr.]
+    noChannels = msdata.shape[1] ## no. of fine channels in ms
+    
+    start = tm.time()
+    #### do precalculations
+    ## calcualte the alt-az of the phase centre
+    mwa_x, mwa_y, mwa_z = np.mean(antloc[:,0]), np.mean(antloc[:,1]), np.mean(antloc[:,2])
+    mwa_alt, mwa_az = getAltAz(mwa_x, mwa_y, mwa_z)
+
+    ## calculate the x,y,z coordinate of the focal point
+    global focus_x, focus_y, focus_z
+    focus_z = args.focus*1e3*np.cos(np.radians(mwa_alt))*np.cos(np.radians(mwa_az))
+    focus_x = args.focus*1e3*np.cos(np.radians(mwa_alt))*np.sin(np.radians(mwa_az))
+    focus_y = args.focus*1e3*np.sin(np.radians(mwa_alt))
+    
+    if verbose:
+        print("mwa alt {} az {}".format(mwa_alt, mwa_az))
+        print("cartesian coord of focus x {} y {} z {}".format(focus_x, focus_y, focus_z))
+
+    ## make list of entries with relevant time
+    converted_time = msTime2UTC(mstime)
+    relevant_indexes = []
+
+    for i in range(entries):
+        t = str(converted_time[i])
+        if str(t) != str(timestep):
+            continue
+        else:
+            relevant_indexes.append(i)
+
+    if verbose:
+        print('found {}/{} relevant ms indexes'.format(len(relevant_indexes), entries))
+
+    if len(relevant_indexes) == 0:
+        print('no delay corrections done. Quitting...')
+        sys.exit(0)
+
+    ## apply delay corrections
+    for i in tqdm(relevant_indexes):
+        worker(i, hdu)
+    
+    elapased = tm.time() - start
+
+    if verbose:
+        print("Phase correction done. Time elapsed {}s".format(elapased))
+
+    ## write corrected data back to ms
+    if verbose:
+        print("writing corrected data to ms...")
+
+    start = tm.time()
+    ms = table(args.ms, readonly=False, ack=False)
+
+    ## create new ms imaging column
+    if "FOCUSED" not in ms.colnames():
+        if verbose:
+            print("ms column FOCUSED does not exist. Making new column")
+        cd1 = makecoldesc("FOCUSED", ms.getcoldesc("CORRECTED_DATA")) ## new column desc
+        tb1 = maketabdesc(cd1) ## new table desc
+        ms.addcols(tb1)
+    else:
+        if verbose:
+            print("ms column FOCUSED alread exists.")
+
+    ms.putcol('FOCUSED', msdata)
+
+    ## create UVW column to store original (farfield) UVW, if it does not already exists
+    if "ORG_UVW" not in ms.colnames():
+        if verbose:
+            print("ms column ORG_UVG does not exist. Making new column.")
+        cd2 = makecoldesc("ORG_UVW", ms.getcoldesc("UVW")) ## new column desc
+        tb2 = maketabdesc(cd2) ## new table desc
+        ms.addcols(tb2)
+    else:
+        if verbose:
+            print("ms column FOCUSED already exists.")
+
+    ms.putcol("ORG_UVW", msuvw_org)
+    ms.flush()
+    ms.close()
+
+    elapsed = tm.time() - start
+    
+    if args.verbose:
+        print("...finished writing to ms. time elapsed {}s".format(elapsed))
+        print("total time taken {}.s".format(tm.time()- global_start))
+
+
+    
+
+    
+
+
+if __name__ == "__main__":
+    parser = ArgumentParser('LEOLens', \
+                description='focuses the array to the desired near-field point')
+    parser.add_argument('--ms', required=True,\
+                help='input measurement set')
+    parser.add_argument('--time', required=True, \
+                help='the time-step to apply corrections')
+    parser.add_argument('--focus', type=float, required=True,\
+                help='the desired focal length (km)')
+    parser.add_argument('--metafits', required=True,\
+                help='the metafits of the observation')
+    parser.add_argument('--verbose', type=bool, default=False,\
+                help='runs scipt in verbose mode (default=False)')
+    args = parser.parse_args()
+
+    global verbose, timeStep
+    verbose = args.verbose
+
+    ## parse different possible types of input datetime formats
+    try:
+        timestep = datetime.strptime(args.time, '%Y-%m-%dT%H:%M:%S.%f')
+    except:
+        timestep = datetime.strptime(args.time, '%Y-%m-%dT%H:%M:%S')
+
+    if verbose:
+        print('running LEOLens in verbose mode.')
+
+    main(args)
+
+
+
