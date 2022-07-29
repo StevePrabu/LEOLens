@@ -16,7 +16,7 @@ import sys
 class MeasurementSet:
     """
     This custom class helps read and write data to the measurement set. 
-    python-casacore is a parent class of MeasurementSet.
+    python-casacore and numpy are a parent class of MeasurementSet.
     """
 
     def __init__(self, msName):
@@ -57,7 +57,7 @@ class MeasurementSet:
             if verbose:
                 print("ms column ORG_UVW does not exist. Using UVW instead.")
 
-        self.uvw_org = self.uvw
+        self.uvw_org = np.copy(self.uvw)
         self.wavelength = 299792458/self.freq
         mset.close()
 
