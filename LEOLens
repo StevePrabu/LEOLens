@@ -19,8 +19,6 @@ class MeasurementSet:
     python-casacore is a parent class of MeasurementSet.
     """
 
-    c = 299792458 ## speed of light (m/s)
-
     def __init__(self, msName):
         self.msName = msName
 
@@ -45,7 +43,7 @@ class MeasurementSet:
         self.noChannels = self.data.shape[1] ## no. of fine channels in ms
         self.noRows = len(self.ant1)
 
-        try:
+        if "ORG_UVW" in mset.colnames():
             """
             note ms column ORG_UVW is my own data column 
             in ms where I store the farfield delays that 
@@ -54,7 +52,7 @@ class MeasurementSet:
             self.uvw = mset.getcol("ORG_UVW")
             if verbose:
                 print("ms column ORG_UVW exists")
-        except:
+        else:
             self.uvw = mset.getcol("UVW")
             if verbose:
                 print("ms column ORG_UVW does not exist. Using UVW instead.")
@@ -215,7 +213,7 @@ def getAntXYZ(antName):
     return tile_x, tile_y, tile_z
 
 
-def getPhase(ant1, ant2, uvw, hdu):
+def getPhase(ant1, ant2, uvw):
     """
     calculates near-field phase/delay for a baseline
 
@@ -224,7 +222,6 @@ def getPhase(ant1, ant2, uvw, hdu):
     ant1    : antenna 1 of the baseline being considered
     ant2    : antenna 2 of the baseline being considered
     uvw     : far field uvw coordinates of the baseline
-    hdu     : the metafits file for the observation
 
     Returns
     -------
@@ -269,7 +266,7 @@ def getFocusXYZ(focus):
     z       : z coordinate of the focus
     """
 
-    ## calcualte the Geocentric mean coordinates of the array and the 
+    ## calcualte the Geocentric mean coordinates of the array
     mwa_x, mwa_y, mwa_z = np.mean(ms.antloc[:,0]), np.mean(ms.antloc[:,1]), np.mean(ms.antloc[:,2])
 
     ## calcualte alt-az of focus from mean position of array
@@ -281,32 +278,6 @@ def getFocusXYZ(focus):
     y = args.focus*1e3*np.sin(np.radians(mwa_alt))
 
     return x, y, z
-
-
-def worker(i):
-    """
-    worker func for a single thread
-    """
-
-    ant1 = ms.ant1[i]
-    ant2 = ms.ant2[i]
-
-    ## filter out auto corr.
-    if ant1 != ant2:
-        uvw = ms.uvw[i]
-
-        phi, w_new = getPhase(ant1, ant2, uvw, hdu)
-
-        ## update old w with new w
-        ms.uvw[i][2] = w_new
-
-        ## phase rotate the visibilities
-        phase = -2j*np.pi*phi/ms.wavelength
-        for pol in range(4):
-            tmp = np.copy(ms.data[i,:,pol])
-            ms.data[i,:,pol] = tmp*np.exp(phase)
-
-    return
 
 
 def getRelevantRows():
@@ -336,6 +307,32 @@ def getRelevantRows():
     return relevant_rows
 
 
+def worker(i):
+    """
+    worker func for a single thread
+    """
+
+    ant1 = ms.ant1[i] #antenna 1 of baseline
+    ant2 = ms.ant2[i] #antenna 2 of baseline
+
+    ## filter out auto corr.
+    if ant1 != ant2:
+        uvw = ms.uvw[i]
+
+        phi, w_new = getPhase(ant1, ant2, uvw)
+
+        ## update old w with new w
+        ms.uvw[i][2] = w_new
+
+        ## phase rotate the visibilities
+        phase = -2j*np.pi*phi/ms.wavelength
+        for pol in range(4):
+            tmp = np.copy(ms.data[i,:,pol])
+            ms.data[i,:,pol] = tmp*np.exp(phase)
+
+    return
+
+
 def main(args):
     """
     main magic happens here
@@ -349,16 +346,16 @@ def main(args):
     ms.read()
     hdu = fits.open(args.metafits)
 
-    start = tm.time() ## timer for calulating phase/delay corrections
+    start = tm.time() ## timer for benchmarking phase/delay corrections
 
-    ## calculate the x,y,z coordinate of the focal point in local reference frame
+    ## calculate the x,y,z coordinate of the focal point in local terrestrial reference frame
     global focus_x, focus_y, focus_z
     focus_x, focus_y, focus_z = getFocusXYZ(args.focus)
     
     ## find indexes of relevant (t=timestep) rows in ms
     relevant_rows = getRelevantRows()
     
-    ## apply delay corrections
+    ## apply delay/phase corrections to relevant rows
     for i in tqdm(relevant_rows):
         worker(i)
     
